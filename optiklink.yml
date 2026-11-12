@@ -1,0 +1,131 @@
+name: OptikLink 每日自动登录+服务器保活
+
+on:
+  schedule:
+    - cron: '0 3 */2 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  auto-login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          pip install requests cloudscraper "requests[socks]" seleniumbase pyvirtualdisplay
+
+      - name: 安装浏览器依赖（Turnstile 需要真实 Chrome + 虚拟显示）
+        run: |
+          set -uo pipefail
+          sudo apt-get update -qq
+          # 22.04 和 24.04 包名不同（24.04 加 t64 后缀），两个名字都试
+          for p in xvfb libnss3 libdrm2 libxkbcommon0 libgbm1 fonts-liberation \
+                   libglib2.0-0 libglib2.0-0t64 libatk1.0-0 libatk1.0-0t64 \
+                   libatk-bridge2.0-0 libatk-bridge2.0-0t64 libcups2 libcups2t64 \
+                   libasound2 libasound2t64; do
+            sudo apt-get install -y -qq "$p" >/dev/null 2>&1 && echo "  ✅ $p" || echo "  ⚠️ $p 跳过"
+          done
+          python -m seleniumbase install || echo "⚠️ SB 内置浏览器安装失败，运行时再试"
+          python -c "import seleniumbase; print('✅ seleniumbase', seleniumbase.__version__)"
+
+      - name: 启用 WARP 网络
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: 执行自动登录+服务器保活脚本
+        id: login
+        env:
+          DISCORD_TOKEN:        ${{ secrets.DISCORD_TOKEN }}
+          BOT_TOKEN:            ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:              ${{ secrets.CHAT_ID }}
+          DISCORD_CLIENT_ID:    ${{ secrets.DISCORD_CLIENT_ID }}
+          DISCORD_REDIRECT_URI: ${{ secrets.DISCORD_REDIRECT_URI }}
+          EXPIRE_DATE:          ${{ secrets.EXPIRE_DATE }}
+          PANEL_API_KEY:        ${{ secrets.PANEL_API_KEY }}
+          PANEL_SERVER_ID:      ${{ secrets.PANEL_SERVER_ID }}
+          PANEL_URL:            "https://control.optiklink.net"
+          SERVER_START_WAIT:    "60"
+        run: |
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python -u optiklink_login.py
+
+      - name: 自动更新 DISCORD_CLIENT_ID Secret
+        if: steps.login.outputs.new_client_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_CID:  ${{ steps.login.outputs.new_client_id }}
+        run: |
+          echo "检测到新 client_id，正在自动更新 Secret..."
+          gh secret set DISCORD_CLIENT_ID --body "$NEW_CID" --repo "$GITHUB_REPOSITORY"
+          echo "✅ Secret DISCORD_CLIENT_ID 已自动更新"
+
+      - name: 提交 time.txt 保持仓库活跃
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "无变化，无需提交"
+          else
+            git commit -m "⏱️ 更新时间文件: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push origin HEAD:main
+          fi
+
+  cleanup-old-runs:
+    runs-on: ubuntu-latest
+    needs: auto-login
+    if: always()
+    permissions:
+      actions: write
+    steps:
+      - name: 删除多余的 workflow run（保留最新 2 条）
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const KEEP = 2;
+            const workflowName = "OptikLink 每日自动登录+服务器保活";
+            const workflows = await github.rest.actions.listRepoWorkflows({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+            });
+            const wf = workflows.data.workflows.find(w => w.name === workflowName);
+            if (!wf) {
+              console.log("未找到 workflow，跳过清理");
+              return;
+            }
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner:       context.repo.owner,
+                repo:        context.repo.repo,
+                workflow_id: wf.id,
+                per_page:    100,
+              }
+            );
+            const toDelete = runs.slice(KEEP);
+            console.log(`共 ${runs.length} 条 run，保留 ${KEEP} 条，删除 ${toDelete.length} 条`);
+            for (const run of toDelete) {
+              await github.rest.actions.deleteWorkflowRun({
+                owner:  context.repo.owner,
+                repo:   context.repo.repo,
+                run_id: run.id,
+              });
+              console.log(`已删除 run #${run.run_number} (id=${run.id})`);
+            }
